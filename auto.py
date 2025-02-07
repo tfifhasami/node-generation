@@ -15,14 +15,34 @@ import logging
 import sys
 import json
 import websocket
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
+import zipfile
+import shutil
+
+# Thread-safe Progress Tracker
+class ProgressTracker:
+    def __init__(self, total_files):
+        self.total_files = total_files
+        self.current_progress = 0
+        self.processed_files = 0
+        self.lock = threading.Lock()
+
+    def update_progress(self, processed_increment=1):
+        with self.lock:
+            self.processed_files += processed_increment
+            new_progress = min(100, (self.processed_files / self.total_files) * 100)
+            
+            # Only send update if progress has changed significantly
+            if new_progress > self.current_progress + 0.5:  # Send update every 0.5% change
+                self.current_progress = new_progress
+                return self.current_progress
+        return None
 
 # Global WebSocket connection
 global_ws = None
 ws_lock = threading.Lock()
 
-# WebSocket event handlers
 def on_open(ws):
     print("WebSocket connection opened")
 
@@ -47,7 +67,6 @@ def setup_websocket(socket_id):
             on_close=on_close
         )
         
-        # Start WebSocket in a separate thread
         wst = threading.Thread(target=ws.run_forever)
         wst.daemon = True
         wst.start()
@@ -67,7 +86,7 @@ def send_progress(progress, message=''):
         with ws_lock:
             if global_ws and global_ws.sock and global_ws.sock.connected:
                 progress_data = {
-                    'progress': progress,
+                    'progress': round(progress, 2),
                     'message': message
                 }
                 global_ws.send(json.dumps(progress_data))
@@ -132,62 +151,57 @@ def write_text_on_pdf(c, text, coordinates, font='Helvetica', font_size=4):
     c.drawString(x, y, bidi_text)
 
 # Function to generate PDF for a single row
-def generate_pdf(row, total_files, index, start_time):
+def generate_pdf(row, progress_tracker, total_files, output_dir):
     try:
-        # Ensure output directory exists
-        output_dir = 'output'
-        if not os.path.exists(output_dir):
-            os.makedirs(output_dir)
+        os.makedirs(output_dir, exist_ok=True)
 
-        if not any(row):  # Skip empty rows
-            logging.error(f"Skipped row {index + 2}: row is empty or undefined.")
-            send_progress((index + 1) / total_files * 100, f"Skipping empty row {index + 2}")
-            return  # Skip this row
+        if not any(row):
+            logging.warning("Skipped empty row")
+            return
 
         row = [str(cell).replace('\xa0', '').strip() if isinstance(cell, str) else cell for cell in row]
 
-        # Load PDF template
+        # PDF generation logic
         reader = PdfReader("certificate.pdf")
         writer = PdfWriter()
         page = reader.pages[0]
 
-        # Create a BytesIO stream for the overlay
         packet = BytesIO()
         can = canvas.Canvas(packet)
 
         # Write text fields from the Excel row
         write_text_on_pdf(can, str(row[3]), coordinates['Référence de certificat'], font_size=8)
-        write_text_on_pdf(can, str(row[22]), coordinates['Date de création'], font_size=8)  # Date de création
-        write_text_on_pdf(can, str(row[2]), coordinates['Numéro chez le déclarant'], font_size=8)  # Numéro chez le déclarant
-        write_text_on_pdf(can, str(row[4].split('-')[2]), coordinates['YYYY de Date de paiement'], font_size=8)  # YYYY de Date de paiement
-        write_text_on_pdf(can, str(row[4]), coordinates['Date de paiement'], font_size=8)  # Date de paiement
+        write_text_on_pdf(can, str(row[22]), coordinates['Date de création'], font_size=8)
+        write_text_on_pdf(can, str(row[2]), coordinates['Numéro chez le déclarant'], font_size=8)
+        write_text_on_pdf(can, str(row[4].split('-')[2]), coordinates['YYYY de Date de paiement'], font_size=8)
+        write_text_on_pdf(can, str(row[4]), coordinates['Date de paiement'], font_size=8)
 
         # Information Déclarant
         write_text_on_pdf(can, 'Matricule fiscale', coordinates['Declarant'], font_size=8)
         write_text_on_pdf(can, '1259149J', coordinates['Id Aziza'], font_size=8)
-        write_text_on_pdf(can, 'STE AZIZA DE COMMERCE DE DETAIL', coordinates['Nom et prenom ou raison sociale'], font_size=8)  # Nom et prenom ou raison sociale
+        write_text_on_pdf(can, 'STE AZIZA DE COMMERCE DE DETAIL', coordinates['Nom et prenom ou raison sociale'], font_size=8)
         write_text_on_pdf(can, '022 ELECTRICITE Z IND BEN AROUS 2013', coordinates['Adresse Aziza'], font_size=8)
         write_text_on_pdf(can, 'VTE PDTS DIVERS', coordinates['Preffession Aziza'], font_size=8)
 
         # Information Béneficiaire
-        write_text_on_pdf(can, str(row[19]), coordinates['type identifiant ben'], font_size=8)  # Identifiant du bénéficiaire
-        write_text_on_pdf(can, str(row[17]), coordinates['Identifiant du bénéficiaire'], font_size=8)  # Identifiant du bénéficiaire
-        write_text_on_pdf(can, str(row[18]), coordinates['Raison social du bénéficiaire'], font_size=8)  # Raison social du bénéficiaire
+        write_text_on_pdf(can, str(row[19]), coordinates['type identifiant ben'], font_size=8)
+        write_text_on_pdf(can, str(row[17]), coordinates['Identifiant du bénéficiaire'], font_size=8)
+        write_text_on_pdf(can, str(row[18]), coordinates['Raison social du bénéficiaire'], font_size=8)
         write_text_on_pdf(can, str(row[23]), coordinates['adresse benificiaire'], font_size=8)
         write_text_on_pdf(can, str(row[24]), coordinates['activite benificiaire'], font_size=8)
 
         # tableau detail declaration
-        write_text_on_pdf(can, str(row[7]), coordinates['totalMontantHT'], font_size=8)  # totalMontantHT
-        write_text_on_pdf(can, str(row[8]), coordinates['Montant total TVA comprise'], font_size=8)  # Montant total TVA comprise
-        write_text_on_pdf(can, str(row[8]), coordinates['Montant total TVA comprise - Total'], font_size=8)  # Montant total TVA comprise - Total
-        write_text_on_pdf(can, '0', coordinates['TVA retenue à la source'], font_size=8)  # TVA retenue à la source
-        write_text_on_pdf(can, str(row[11]), coordinates['TVA_due'], font_size=8)  # TVA_due
-        write_text_on_pdf(can, str(row[8]), coordinates['Montant de la retenue'], font_size=8)  # Montant de la retenue
+        write_text_on_pdf(can, str(row[7]), coordinates['totalMontantHT'], font_size=8)
+        write_text_on_pdf(can, str(row[8]), coordinates['Montant total TVA comprise'], font_size=8)
+        write_text_on_pdf(can, str(row[8]), coordinates['Montant total TVA comprise - Total'], font_size=8)
+        write_text_on_pdf(can, '0', coordinates['TVA retenue à la source'], font_size=8)
+        write_text_on_pdf(can, str(row[11]), coordinates['TVA_due'], font_size=8)
+        write_text_on_pdf(can, str(row[8]), coordinates['Montant de la retenue'], font_size=8)
+        write_text_on_pdf(can, str(row[10]), coordinates['Taux de la retenue'], font_size=8)
+        write_text_on_pdf(can, str(row[12]), coordinates['Montant servie'], font_size=8)
+        write_text_on_pdf(can, str(row[12]), coordinates['Montant servie - Total'], font_size=8)
 
-        write_text_on_pdf(can, str(row[10]), coordinates['Taux de la retenue'], font_size=8)  # Taux de la retenue
-        write_text_on_pdf(can, str(row[12]), coordinates['Montant servie'], font_size=8)  # Montant servi-1
-        write_text_on_pdf(can, str(row[12]), coordinates['Montant servie - Total'], font_size=8)  # Montant servi-2
-
+        # QR Code text
         write_text_on_pdf(can, f"{row[0]}#{row[4].split('-')[2]}#{row[4].split('-')[1]}#1#{row[3]}", (60, 60), font_size=15)
 
         # Generate QR code
@@ -197,70 +211,90 @@ def generate_pdf(row, total_files, index, start_time):
         qr.make(fit=True)
         qr_img = qr.make_image(fill_color="black", back_color="white")
 
-        # Convert QR code image to byte stream
         qr_byte_stream = BytesIO()
         qr_img.save(qr_byte_stream, format='PNG')
         qr_byte_stream.seek(0)
         qr_image = ImageReader(qr_byte_stream)
 
         can.drawImage(qr_image, 40, 120, width=100, height=100)
-
-        # Save overlay to the PDF
         can.save()
 
-        # Merge the overlay with the original PDF
         packet.seek(0)
         overlay_pdf = PdfReader(packet)
         page.merge_page(overlay_pdf.pages[0])
-
-        # Add page to writer 
         writer.add_page(page)
 
-        # Save the PDF
         output_pdf_name = os.path.join(output_dir, f"certificat_{row[17]}_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.pdf")
         with open(output_pdf_name, "wb") as output_pdf:
             writer.write(output_pdf)
 
-        logging.info(f"Generated PDF for {row[3]}")
-
-        # Send progress update
-        progress = (index + 1) / total_files * 100
-        send_progress(progress, f"Generated PDF for {row[3]}")
+        # Progress tracking
+        processed_progress = progress_tracker.update_progress()
+        if processed_progress is not None:
+            send_progress(processed_progress, f"Generated PDF: {processed_progress:.2f}%")
 
     except Exception as e:
-        logging.error(f"Error processing row {row[3] if len(row) > 3 else 'Unknown'}: {str(e)}")
-        send_progress((index + 1) / total_files * 100, f"Error processing row: {str(e)}")
-        
-# Function to process files
+        logging.error(f"PDF Generation Error: {e}")
+        processed_progress = progress_tracker.update_progress()
+        if processed_progress is not None:
+            send_progress(processed_progress, f"Error: {processed_progress:.2f}%")
+
 def process_files(excel_file, socket_id):
-    # Setup WebSocket connection first
     setup_websocket(socket_id)
     
-    # Load Excel file
     wb = openpyxl.load_workbook(excel_file, data_only=True)
     sheet = wb.active
     
     total_files = sheet.max_row - 1
-    setup_logging()
+    logging.basicConfig(level=logging.INFO)
     
-    # Initial progress update
+    progress_tracker = ProgressTracker(total_files)
+    
+    # Create datetime-based output directory
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_dir = f'output_{timestamp}'
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Create outputs directory
+    output_folder = os.path.join(os.getcwd(), "outputs")
+    os.makedirs(output_folder, exist_ok=True)
+
     send_progress(0, "Starting PDF generation")
-    
+
     start_time = time.time()
-    
-    # Process files in parallel
-    with ThreadPoolExecutor() as executor:
-        for index, row in enumerate(sheet.iter_rows(min_row=2, max_row=sheet.max_row, values_only=True)):
-            executor.submit(generate_pdf, row, total_files, index, start_time)
-    
-    # Final progress update
-    send_progress(100, "PDF generation completed")
-    
-    # Print total processing time
+
+    with ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
+        futures = [
+            executor.submit(generate_pdf, row, progress_tracker, total_files, output_dir)
+            for row in sheet.iter_rows(min_row=2, max_row=sheet.max_row, values_only=True)
+        ]
+        
+        for future in as_completed(futures):
+            future.result()
+
+    send_progress(95, "Creating ZIP archive")
+
+    # Store ZIP file in outputs/ folder
+    zip_filename = os.path.join(output_folder, f'output_{timestamp}.zip')
+    with zipfile.ZipFile(zip_filename, 'w', zipfile.ZIP_DEFLATED) as zipf:
+        for root, dirs, files in os.walk(output_dir):
+            for file in files:
+                file_path = os.path.join(root, file)
+                arcname = os.path.relpath(file_path, output_dir)
+                zipf.write(file_path, arcname)
+
+    # Clean up the original directory after zipping
+    shutil.rmtree(output_dir)
+
+    send_progress(100, "PDF generation and ZIP creation completed")
+
     total_time = time.time() - start_time
     print(f"\nTotal processing time: {total_time / 60:.2f} minutes")
+    print(f"Output file: {zip_filename}")
 
-# Main execution
+    return zip_filename
+
+
 if __name__ == "__main__":
     excel_file = sys.argv[1]
     socket_id = sys.argv[2]

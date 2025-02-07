@@ -1,0 +1,8 @@
+# Create a file named requirements.txt with these contents
+openpyxl
+reportlab
+PyPDF2
+arabic-reshaper
+python-bidi
+qrcode
+websocket-client
